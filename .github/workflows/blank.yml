@@ -1,0 +1,724 @@
+#name: PC criado pelo @alves7.pcm
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: 'Instance Number (1-10)'
+        required: true
+        default: '1'
+        type: string
+
+jobs:
+  deploy-rdp:
+    runs-on: windows-11-arm
+    timeout-minutes: 360
+
+    steps:
+
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+
+      # ============================================================
+      # SYSTEM INFORMATION
+      # ============================================================
+
+      - name: System Information
+        shell: powershell
+        run: |
+          Write-Host "=== ENIGMANO RDP DEPLOYMENT ===" -ForegroundColor Green
+
+          Write-Host "Instance Number: ${{ github.event.inputs.instance_number }}" -ForegroundColor Yellow
+          Write-Host "Runner: $env:RUNNER_NAME" -ForegroundColor Yellow
+          Write-Host "Workflow: $env:GITHUB_WORKFLOW" -ForegroundColor Yellow
+
+          Write-Host "`n=== SYSTEM SPECIFICATIONS ===" -ForegroundColor Cyan
+
+          Get-ComputerInfo |
+            Select-Object WindowsProductName, WindowsVersion, TotalPhysicalMemory
+
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+
+          Write-Host "`n=== ARCHITECTURE ===" -ForegroundColor Cyan
+
+          Write-Host "PROCESSOR_ARCHITECTURE: $env:PROCESSOR_ARCHITECTURE"
+          Write-Host "PROCESSOR_ARCHITEW6432: $env:PROCESSOR_ARCHITEW6432"
+
+
+      # ============================================================
+      # ENABLE RDP
+      # ============================================================
+
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          Write-Host "Enabling Remote Desktop..." -ForegroundColor Green
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Remote Desktop enabled successfully." -ForegroundColor Green
+
+
+      # ============================================================
+      # CREATE USER ACCOUNT
+      # ============================================================
+
+      - name: Create User Account
+        shell: powershell
+        run: |
+          Write-Host "Setting up user accounts..." -ForegroundColor Green
+
+          $Password = ConvertTo-SecureString "P@ssw0rd!" -AsPlainText -Force
+
+          # --------------------------------------------------------
+          # runneradmin
+          # --------------------------------------------------------
+
+          $user = Get-LocalUser `
+            -Name "runneradmin" `
+            -ErrorAction SilentlyContinue
+
+          if ($user) {
+
+            Set-LocalUser `
+              -Name "runneradmin" `
+              -Password $Password
+
+          }
+          else {
+
+            New-LocalUser `
+              -Name "runneradmin" `
+              -Password $Password `
+              -AccountNeverExpires `
+              -PasswordNeverExpires `
+              -UserMayNotChangePassword
+
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "runneradmin" `
+            -ErrorAction SilentlyContinue
+
+
+          # --------------------------------------------------------
+          # Rafael
+          # --------------------------------------------------------
+
+          $rafael = Get-LocalUser `
+            -Name "Rafael" `
+            -ErrorAction SilentlyContinue
+
+          if (-not $rafael) {
+
+            Write-Host "Creating Rafael as Administrator..." -ForegroundColor Yellow
+
+            New-LocalUser `
+              -Name "Rafael" `
+              -Password $Password `
+              -AccountNeverExpires `
+              -PasswordNeverExpires
+
+            Write-Host "Rafael created." -ForegroundColor Green
+
+          }
+          else {
+
+            Write-Host "Rafael already exists. Updating password..." -ForegroundColor Yellow
+
+            Set-LocalUser `
+              -Name "Rafael" `
+              -Password $Password
+
+          }
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "Rafael" `
+            -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "Rafael" `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Username: Rafael" -ForegroundColor Yellow
+          Write-Host "Password: P@ssw0rd!" -ForegroundColor Yellow
+
+
+      # ============================================================
+      # TAILSCALE DEPENDENCIES
+      # ============================================================
+
+      - name: Prepare Tailscale Dependencies
+        shell: powershell
+        run: |
+          Write-Host "=== PREPARING TAILSCALE DEPENDENCIES ===" -ForegroundColor Green
+
+          $requiredServices = @(
+            "Dnscache",
+            "iphlpsvc",
+            "netprofm",
+            "WinHttpAutoProxySvc"
+          )
+
+          foreach ($serviceName in $requiredServices) {
+
+            Write-Host "`nChecking service: $serviceName" -ForegroundColor Yellow
+
+            $service = Get-Service `
+              -Name $serviceName `
+              -ErrorAction SilentlyContinue
+
+            if (-not $service) {
+              continue
+            }
+
+            if ($service.StartType -eq "Disabled") {
+
+              Set-Service `
+                -Name $serviceName `
+                -StartupType Automatic `
+                -ErrorAction SilentlyContinue
+
+            }
+
+            if ((Get-Service -Name $serviceName).Status -ne "Running") {
+
+              Start-Service `
+                -Name $serviceName `
+                -ErrorAction SilentlyContinue
+
+              Start-Sleep -Seconds 3
+
+            }
+
+            Write-Host "$serviceName final status: $((Get-Service -Name $serviceName).Status)" -ForegroundColor Green
+          }
+
+
+      # ============================================================
+      # INSTALL TAILSCALE
+      # ============================================================
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          Write-Host "=== INSTALLING TAILSCALE ===" -ForegroundColor Green
+
+          $installerPath = "$env:TEMP\tailscale-setup.exe"
+
+          if (Test-Path $installerPath) {
+
+            Remove-Item `
+              $installerPath `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+          }
+
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.102.4.exe"
+
+          Write-Host "Downloading Tailscale..." -ForegroundColor Yellow
+
+          try {
+
+            Invoke-WebRequest `
+              -Uri $tsUrl `
+              -OutFile $installerPath `
+              -UseBasicParsing `
+              -ErrorAction Stop
+
+          }
+          catch {
+
+            Write-Host "Tailscale download failed." -ForegroundColor Red
+            Write-Host $_.Exception.Message -ForegroundColor Red
+            exit 1
+
+          }
+
+          if (
+            -not (Test-Path $installerPath) -or
+            (Get-Item $installerPath).Length -lt 1000000
+          ) {
+
+            Write-Host "Invalid Tailscale installer." -ForegroundColor Red
+            exit 1
+
+          }
+
+          $installProcess = Start-Process `
+            -FilePath $installerPath `
+            -ArgumentList "/quiet" `
+            -Wait `
+            -PassThru
+
+          if ($installProcess.ExitCode -ne 0) {
+
+            Write-Host "Tailscale installation failed." -ForegroundColor Red
+            exit $installProcess.ExitCode
+
+          }
+
+          Remove-Item `
+            $installerPath `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          $tailscaleExe = "C:\Program Files\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscaleExe)) {
+
+            Write-Host "Tailscale executable not found." -ForegroundColor Red
+            exit 1
+
+          }
+
+          & $tailscaleExe version
+
+
+      # ============================================================
+      # START TAILSCALE
+      # ============================================================
+
+      - name: Start Tailscale
+        shell: powershell
+        run: |
+          Write-Host "=== STARTING TAILSCALE ===" -ForegroundColor Green
+
+          $tailscaleExe = "C:\Program Files\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscaleExe)) {
+
+            Write-Host "Tailscale executable not found." -ForegroundColor Red
+            exit 1
+
+          }
+
+          $service = Get-Service `
+            -Name "Tailscale" `
+            -ErrorAction SilentlyContinue
+
+          if (-not $service) {
+
+            Write-Host "Tailscale service not found." -ForegroundColor Red
+            exit 1
+
+          }
+
+          if ($service.Status -ne "Running") {
+
+            Start-Service `
+              -Name "Tailscale" `
+              -ErrorAction SilentlyContinue
+
+            Start-Sleep -Seconds 10
+
+          }
+
+          if ((Get-Service -Name "Tailscale").Status -ne "Running") {
+
+            Write-Host "Tailscale service failed to start." -ForegroundColor Red
+            exit 1
+
+          }
+
+          & $tailscaleExe set --unattended=true 2>&1
+
+          if ($LASTEXITCODE -ne 0) {
+
+            $policyPath = "HKLM:\SOFTWARE\Policies\Tailscale"
+
+            if (-not (Test-Path $policyPath)) {
+
+              New-Item `
+                -Path $policyPath `
+                -Force |
+                Out-Null
+
+            }
+
+            New-ItemProperty `
+              -Path $policyPath `
+              -Name "UnattendedMode" `
+              -PropertyType String `
+              -Value "always" `
+              -Force |
+              Out-Null
+
+            & $tailscaleExe syspolicy reload 2>&1
+
+            Start-Sleep -Seconds 3
+
+          }
+
+          & $tailscaleExe set --accept-dns=false 2>&1
+
+          Start-Sleep -Seconds 3
+
+          Write-Host "Connecting Tailscale..." -ForegroundColor Green
+
+          & $tailscaleExe up `
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
+            --hostname="PC-criado-pelo-alves7.pcm" `
+            --accept-routes `
+            --accept-dns=false `
+            --unattended `
+            --timeout=120s
+
+          if ($LASTEXITCODE -ne 0) {
+
+            & $tailscaleExe status 2>&1
+            exit 1
+
+          }
+
+          $connected = $false
+          $tsIP = $null
+
+          for ($i = 1; $i -le 24; $i++) {
+
+            Start-Sleep -Seconds 5
+
+            $statusOutput = (
+              & $tailscaleExe status 2>&1 |
+              Out-String
+            )
+
+            if (
+              $statusOutput -notmatch "NoState" -and
+              $statusOutput -notmatch "NeedsLogin"
+            ) {
+
+              $candidate = (
+                & $tailscaleExe ip -4 2>&1 |
+                Select-Object -First 1
+              ).ToString().Trim()
+
+              if ($candidate -match "^\d{1,3}(\.\d{1,3}){3}$") {
+
+                $tsIP = $candidate
+                $connected = $true
+
+                Write-Host "TAILSCALE CONNECTED - IP: $tsIP" -ForegroundColor Green
+
+                break
+
+              }
+
+            }
+
+          }
+
+          if (-not $connected) {
+
+            & $tailscaleExe status 2>&1
+            exit 1
+
+          }
+
+
+      # ============================================================
+      # GET TAILSCALE IP
+      # ============================================================
+
+      - name: Get Tailscale IP
+        shell: powershell
+        run: |
+          $tailscaleExe = "C:\Program Files\Tailscale\tailscale.exe"
+
+          $tsIP = $null
+
+          for ($i = 1; $i -le 12; $i++) {
+
+            Start-Sleep -Seconds 3
+
+            $candidate = (
+              & $tailscaleExe ip -4 2>&1 |
+              Select-Object -First 1
+            ).ToString().Trim()
+
+            if ($candidate -match "^\d{1,3}(\.\d{1,3}){3}$") {
+
+              $tsIP = $candidate
+              break
+
+            }
+
+          }
+
+          if (-not $tsIP) {
+            exit 1
+          }
+
+          Write-Host "Tailscale IP: $tsIP" -ForegroundColor Green
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+
+      # ============================================================
+      # INSTALL GOOGLE CHROME - CORRIGIDO
+      # ============================================================
+
+      - name: Install Google Chrome (Direct)
+        shell: powershell
+        run: |
+          Write-Host "=== INSTALLING GOOGLE CHROME ARM64 ===" -ForegroundColor Green
+
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          $chromeUrl = "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise_arm64.msi"
+          $installerPath = "$env:TEMP\chrome_installer.msi"
+
+          if (Test-Path $installerPath) {
+
+            Remove-Item `
+              $installerPath `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+          }
+
+          $downloaded = $false
+
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+
+            Write-Host "Chrome download attempt $attempt of 5..." -ForegroundColor Yellow
+
+            try {
+
+              & curl.exe `
+                --location `
+                --fail `
+                --retry 3 `
+                --retry-delay 5 `
+                --connect-timeout 30 `
+                --max-time 300 `
+                --tlsv1.2 `
+                --user-agent "Mozilla/5.0" `
+                --output $installerPath `
+                $chromeUrl
+
+              if (
+                $LASTEXITCODE -eq 0 -and
+                (Test-Path $installerPath) -and
+                (Get-Item $installerPath).Length -gt 1000000
+              ) {
+
+                $downloaded = $true
+                break
+
+              }
+
+            }
+            catch {
+
+              Write-Host "Chrome download attempt failed." -ForegroundColor Yellow
+              Write-Host $_.Exception.Message -ForegroundColor Yellow
+
+            }
+
+            if (Test-Path $installerPath) {
+
+              Remove-Item `
+                $installerPath `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+            }
+
+            Start-Sleep -Seconds 5
+
+          }
+
+          if (-not $downloaded) {
+
+            Write-Host "ERROR: Chrome installer could not be downloaded." -ForegroundColor Red
+            exit 1
+
+          }
+
+          Write-Host "Chrome installer downloaded successfully." -ForegroundColor Green
+
+          $chromeSize = (Get-Item $installerPath).Length
+
+          Write-Host "Chrome installer size: $chromeSize bytes" -ForegroundColor Cyan
+
+          Write-Host "Installing Google Chrome..." -ForegroundColor Yellow
+
+          $chromeInstall = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList "/i `"$installerPath`" /qn /norestart" `
+            -Wait `
+            -PassThru
+
+          if ($chromeInstall.ExitCode -ne 0) {
+
+            Write-Host "Google Chrome installation failed." -ForegroundColor Red
+            Write-Host "MSI exit code: $($chromeInstall.ExitCode)" -ForegroundColor Red
+            exit $chromeInstall.ExitCode
+
+          }
+
+          Remove-Item `
+            $installerPath `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Google Chrome installed successfully." -ForegroundColor Green
+
+
+      # ============================================================
+      # INSTALL 7-ZIP ARM64
+      # ============================================================
+
+      - name: Install 7-Zip (Direct)
+        shell: powershell
+        run: |
+          Write-Host "=== INSTALLING 7-ZIP ARM64 ===" -ForegroundColor Green
+
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          $zipUrl = "https://www.7-zip.org/a/7z2501-arm64.exe"
+          $installerPath = "$env:TEMP\7z-installer.exe"
+
+          if (Test-Path $installerPath) {
+
+            Remove-Item `
+              $installerPath `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+          }
+
+          $downloaded = $false
+
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+
+            Write-Host "7-Zip download attempt $attempt of 5..." -ForegroundColor Yellow
+
+            try {
+
+              & curl.exe `
+                --location `
+                --fail `
+                --retry 3 `
+                --retry-delay 5 `
+                --connect-timeout 30 `
+                --max-time 300 `
+                --tlsv1.2 `
+                --user-agent "Mozilla/5.0" `
+                --output $installerPath `
+                $zipUrl
+
+              if (
+                $LASTEXITCODE -eq 0 -and
+                (Test-Path $installerPath) -and
+                (Get-Item $installerPath).Length -gt 500000
+              ) {
+
+                $downloaded = $true
+                break
+
+              }
+
+            }
+            catch {
+
+              Write-Host "7-Zip download attempt failed." -ForegroundColor Yellow
+              Write-Host $_.Exception.Message -ForegroundColor Yellow
+
+            }
+
+            if (Test-Path $installerPath) {
+
+              Remove-Item `
+                $installerPath `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+            }
+
+            Start-Sleep -Seconds 5
+
+          }
+
+          if (-not $downloaded) {
+
+            Write-Host "ERROR: 7-Zip installer could not be downloaded." -ForegroundColor Red
+            exit 1
+
+          }
+
+          Write-Host "7-Zip installer downloaded successfully." -ForegroundColor Green
+
+          Start-Process `
+            -FilePath $installerPath `
+            -ArgumentList "/S" `
+            -Wait
+
+          if ($LASTEXITCODE -ne 0) {
+
+            Write-Host "7-Zip installation returned an error." -ForegroundColor Red
+
+          }
+
+          Remove-Item `
+            $installerPath `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "7-Zip installation completed." -ForegroundColor Green
+
+
+      # ============================================================
+      # CONNECTION DETAILS
+      # ============================================================
+
+      - name: Connection Details
+        shell: powershell
+        run: |
+          Write-Host "`n=== CONNECTION DETAILS (TAILSCALE) ===" -ForegroundColor Green
+          Write-Host "========================================" -ForegroundColor Cyan
+          Write-Host "        ENIGMANO RDP ACCESS" -ForegroundColor Cyan
+          Write-Host "========================================" -ForegroundColor Cyan
+
+          Write-Host "Host: $env:TAILSCALE_IP" -ForegroundColor White
+          Write-Host "Username: Rafael" -ForegroundColor White
+          Write-Host "Password: P@ssw0rd!" -ForegroundColor White
+
+          Write-Host "========================================" -ForegroundColor Cyan
+
+          Write-Host "1. Install Tailscale on your device." -ForegroundColor White
+          Write-Host "2. Connect to the same Tailscale account." -ForegroundColor White
+          Write-Host "3. Open Remote Desktop." -ForegroundColor White
+          Write-Host "4. Enter the Tailscale IP." -ForegroundColor White
+          Write-Host "5. Username: Rafael" -ForegroundColor White
+          Write-Host "6. Password: P@ssw0rd!" -ForegroundColor White
+
+
+      # ============================================================
+      # KEEP SESSION ALIVE
+      # ============================================================
+
+      - name: 
